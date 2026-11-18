@@ -1,0 +1,45 @@
+# Evidence: why WeRead dies on startup in Waydroid (kernel without ashmem)
+#
+# 采集方式：
+#   sudo strace -f -tt -o out.log -p <com.tencent.weread.eink 的 host pid>
+# 触发方式：waydroid app launch com.tencent.weread.eink
+# 环境：内核 7.3.4-x64v3-xanmod1-1-bore-cjktty（无 CONFIG_ASHMEM），
+#       Waydroid 1.6.3 + waydroid-nvidia-bin 0.2.0（venus 模式），
+#       waydroid.prop: sys.use_memfd=true（memfd 模拟 ashmem，官方支持，已生效）
+#
+# 关键片段（主线程 56556）：
+
+56556 23:48:00.137874 prctl(PR_GET_DUMPABLE) = 0 (SUID_DUMP_DISABLE)
+56556 23:48:00.137916 memfd_create("CursorWindow: /data/user/0/com.t"..., MFD_CLOEXEC|MFD_ALLOW_SEALING) = 76
+56556 23:48:00.137945 ftruncate64(76, 2097152) = 0
+56556 23:48:00.137964 fcntl64(76, F_ADD_SEALS, F_SEAL_SHRINK|F_SEAL_GROW) = 0
+56556 23:48:00.137986 ioctl(76, _IOC(_IOC_WRITE, 0x77, 0x5, 0x4), 0x3) = -1 ENOTTY (对设备不适当的 ioctl 操作)
+56556 23:48:00.138019 close(76) = 0
+56556 23:48:00.138154 writev(5, [... "CursorWindow\0" ..., "Could not allocate CursorWindow "..., 124}], 4) = 149
+56556 23:48:00.138482 writev(5, [... "AndroidRuntime\0", "Shutting down VM\n\0", 18}], 4) = 45
+56556 23:48:00.138914 writev(5, [... "AndroidRuntime\0", "FATAL EXCEPTION: main\nProcess: c"..., 3809}], 4) = 3836
+
+# ioctl 解码：0x77 = __ASHMEMIOC，nr=5 = ASHMEM_SET_PROT_MASK，参数 0x3 = PROT_READ|PROT_WRITE
+#
+# 结论：
+#   1. memfd 路径本身完全正常（memfd_create / ftruncate / F_ADD_SEALS 全成功），
+#      所以 "sys.use_memfd=true 没生效" 之类的猜测不成立 —— 它已经生效了。
+#   2. 失败的是 memfd 之后的 legacy ashmem ioctl：memfd 不是 ashmem 字符设备，
+#      不支持 ASHMEM_SET_PROT_MASK，返回 ENOTTY。
+#   3. 发这个 ioctl 的不是系统库，而是 App 自带的 libmoai-sqlite.so：
+#        readelf -W --dyn-syms lib/armeabi-v7a/libmoai-sqlite.so
+#          ashmem_create_region    size=4    (thunk → libcutils 的 memfd 实现)
+#          ashmem_set_prot_region  size=56   (自己实现的裸 ioctl，未检查 fd 类型)
+#      x86_64 的 system/lib64/libcutils.so 里同名函数是 memfd-aware 的
+#      (先 ashmem_valid(fd)，是 memfd 就走 fcntl，不发 ioctl)，所以系统 App 不崩。
+#
+# 对应的崩溃报告（Android dropbox）：
+#   ~/.local/share/waydroid/data/system/dropbox/data_app_crash@*.txt
+#   java.lang.RuntimeException: Unable to create application com.tencent.weread.WRApplication:
+#     CursorWindowAllocationException: Cursor window allocation of 2048 kb failed.
+#     at com.tencent.moai.database.sqlite.CursorWindow.create(...)
+#     at moai.storage.Cache$CacheWrapper.optional(...)
+#     at com.tencent.weread.account.AppSettingManager.getCurrentLoginAccountId(...)
+#
+# 上游 issue（同一崩溃，仍 open、0 评论）：
+#   https://github.com/waydroid/waydroid/issues/2080
